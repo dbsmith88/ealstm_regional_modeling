@@ -16,9 +16,10 @@ import random
 import sys
 from collections import defaultdict
 from datetime import datetime
-from pathlib import Path, PosixPath
+from pathlib import Path, PosixPath, WindowsPath
 from typing import Dict, List, Tuple
 
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -26,14 +27,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from papercode.datasets import CamelsH5, CamelsTXT
-from papercode.datautils import (add_camels_attributes, load_attributes,
-                                 rescale_features)
-from papercode.ealstm import EALSTM
-from papercode.lstm import LSTM
-from papercode.metrics import calc_nse
-from papercode.nseloss import NSELoss
-from papercode.utils import create_h5_files, get_basin_list
+from app.datasets import CamelsH5, CamelsTXT, CamelsSqlite
+# from app.datautils import (add_camels_attributes, load_attributes,
+#                                  rescale_features)
+
+from app.dbutils import (load_attributes, rescale_features)
+
+from app.ealstm import EALSTM
+from app.lstm import LSTM
+from app.metrics import calc_nse
+from app.nseloss import NSELoss
+from app.utils import create_h5_files, get_basin_list, create_h5_from_db
 
 ###########
 # Globals #
@@ -59,7 +63,6 @@ GLOBAL_SETTINGS = {
 
 # check if GPU is available
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
 ###############
 # Prepare run #
 ###############
@@ -75,7 +78,13 @@ def get_args() -> Dict:
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=["train", "evaluate", "eval_robustness"])
-    parser.add_argument('--camels_root', type=str, help="Root directory of CAMELS data set")
+    parser.add_argument('--gauges_path', type=str, help="Path to gages list file")
+    parser.add_argument('--db_path', type=str, help="Path to sqlite database")
+    parser.add_argument('--physio_division', type=str, help="Select only gauges in the specified physiographic "
+                                                            "division")
+    parser.add_argument('--physio_province', type=str, help="Select only gauges in the specified physiographic "
+                                                            "province, if division argment is present will defer.")
+
     parser.add_argument('--seed', type=int, required=False, help="Random seed")
     parser.add_argument('--run_dir', type=str, help="For evaluation mode. Path to run directory.")
     parser.add_argument('--cache_data',
@@ -116,10 +125,6 @@ def get_args() -> Dict:
         for key, val in cfg.items():
             print(f"{key}: {val}")
 
-    # convert path to PosixPath object
-    cfg["camels_root"] = Path(cfg["camels_root"])
-    if cfg["run_dir"] is not None:
-        cfg["run_dir"] = Path(cfg["run_dir"])
     return cfg
 
 
@@ -155,7 +160,7 @@ def _setup_run(cfg: Dict) -> Dict:
     with (cfg["run_dir"] / 'cfg.json').open('w') as fp:
         temp_cfg = {}
         for key, val in cfg.items():
-            if isinstance(val, PosixPath):
+            if isinstance(val, PosixPath) or isinstance(val, WindowsPath):
                 temp_cfg[key] = str(val)
             elif isinstance(val, pd.Timestamp):
                 temp_cfg[key] = val.strftime(format="%d%m%Y")
@@ -166,7 +171,7 @@ def _setup_run(cfg: Dict) -> Dict:
     return cfg
 
 
-def _prepare_data(cfg: Dict, basins: List) -> Dict:
+def _prepare_data(cfg: Dict, gauges: List) -> Dict:
     """Preprocess training data.
 
     Parameters
@@ -181,15 +186,12 @@ def _prepare_data(cfg: Dict, basins: List) -> Dict:
     dict
         Dictionary containing the updated run config
     """
-    # create database file containing the static basin attributes
-    cfg["db_path"] = str(cfg["run_dir"] / "attributes.db")
-    add_camels_attributes(cfg["camels_root"], db_path=cfg["db_path"])
 
     # create .h5 files for train and validation data
     cfg["train_file"] = cfg["train_dir"] / 'train_data.h5'
-    create_h5_files(camels_root=cfg["camels_root"],
+    create_h5_from_db(db_path=cfg["db_path"],
                     out_file=cfg["train_file"],
-                    basins=basins,
+                    basins=gauges,
                     dates=[cfg["train_start"], cfg["train_end"]],
                     with_basin_str=True,
                     seq_length=cfg["seq_length"])
@@ -302,13 +304,20 @@ def train(cfg):
     torch.cuda.manual_seed(cfg["seed"])
     torch.manual_seed(cfg["seed"])
 
-    basins = get_basin_list()
+    division = None
+    province = None
+    if cfg["physio_division"]:
+        division = cfg["physio_division"]
+    if cfg["physio_province"]:
+        province = cfg["physio_province"]
+
+    basins = get_basin_list(cfg['gauges_path'], division, province)
 
     # create folder structure for this run
     cfg = _setup_run(cfg)
 
     # prepare data for training
-    cfg = _prepare_data(cfg=cfg, basins=basins)
+    cfg = _prepare_data(cfg=cfg, gauges=basins)
 
     # prepare PyTorch DataLoader
     ds = CamelsH5(h5_file=cfg["train_file"],
@@ -323,8 +332,8 @@ def train(cfg):
                         num_workers=cfg["num_workers"])
 
     # create model and optimizer
-    input_size_stat = 0 if cfg["no_static"] else 27
-    input_size_dyn = 5 if (cfg["no_static"] or not cfg["concat_static"]) else 32
+    input_size_stat = 0 if cfg["no_static"] else ds.df.shape[1]
+    input_size_dyn = 5 if (cfg["no_static"] or not cfg["concat_static"]) else 5 + input_size_stat
     model = Model(input_size_dyn=input_size_dyn,
                   input_size_stat=input_size_stat,
                   hidden_size=cfg["hidden_size"],
@@ -431,22 +440,20 @@ def evaluate(user_cfg: Dict):
         Dictionary containing the user entered evaluation config
         
     """
-    with open(user_cfg["run_dir"] / 'cfg.json', 'r') as fp:
+    with open(os.path.join(user_cfg["run_dir"], 'cfg.json'), 'r') as fp:
         run_cfg = json.load(fp)
 
-    basins = get_basin_list()
+    gauges = get_basin_list(run_cfg['gauges_path'], run_cfg["physio_division"], run_cfg["physio_province"])
 
     # get attribute means/stds
-    db_path = str(user_cfg["run_dir"] / "attributes.db")
-    attributes = load_attributes(db_path=db_path, 
-                                 basins=basins,
-                                 drop_lat_lon=True)
+    db_path = run_cfg['db_path']
+    attributes = load_attributes(db_path=db_path, gauges=gauges)
     means = attributes.mean()
     stds = attributes.std()
 
     # create model
-    input_size_stat = 0 if run_cfg["no_static"] else 27
-    input_size_dyn = 5 if (run_cfg["no_static"] or not run_cfg["concat_static"]) else 32
+    input_size_stat = 0 if user_cfg["no_static"] else 19
+    input_size_dyn = 5 if (user_cfg["no_static"] or not user_cfg["concat_static"]) else 5 + input_size_stat
     model = Model(input_size_dyn=input_size_dyn,
                   input_size_stat=input_size_stat,
                   hidden_size=run_cfg["hidden_size"],
@@ -455,14 +462,13 @@ def evaluate(user_cfg: Dict):
                   no_static=run_cfg["no_static"]).to(DEVICE)
 
     # load trained model
-    weight_file = user_cfg["run_dir"] / 'model_epoch30.pt'
+    weight_file = os.path.join(user_cfg["run_dir"], 'model_epoch30.pt')
     model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
 
     date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"], end=GLOBAL_SETTINGS["val_end"])
     results = {}
-    for basin in tqdm(basins):
-        ds_test = CamelsTXT(camels_root=user_cfg["camels_root"],
-                            basin=basin,
+    for gauge in tqdm(gauges):
+        ds_test = CamelsSqlite(gage_id=gauge,
                             dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
                             is_train=False,
                             seq_length=run_cfg["seq_length"],
@@ -471,13 +477,10 @@ def evaluate(user_cfg: Dict):
                             attribute_stds=stds,
                             concat_static=run_cfg["concat_static"],
                             db_path=db_path)
-        loader = DataLoader(ds_test, batch_size=1024, shuffle=False, num_workers=4)
-
+        loader = DataLoader(ds_test, batch_size=1024, shuffle=False, num_workers=5)
         preds, obs = evaluate_basin(model, loader)
-
         df = pd.DataFrame(data={'qobs': obs.flatten(), 'qsim': preds.flatten()}, index=date_range)
-
-        results[basin] = df
+        results[gauge] = df
 
     _store_results(user_cfg, run_cfg, results)
 
@@ -554,36 +557,45 @@ def eval_robustness(user_cfg: Dict):
     n_repetitions = 50
     scales = [0.1 * i for i in range(11)]
 
-    with open(user_cfg["run_dir"] / 'cfg.json', 'r') as fp:
+    with open(os.path.join(user_cfg["run_dir"], 'cfg.json'), 'r') as fp:
         run_cfg = json.load(fp)
 
     if run_cfg["concat_static"] or run_cfg["no_static"]:
         raise NotImplementedError("This function is only implemented for EA-LSTM models")
 
-    basins = get_basin_list()
+    division = None
+    province = None
+    if user_cfg["physio_division"]:
+        division = user_cfg["physio_division"]
+    if user_cfg["physio_province"]:
+        province = user_cfg["physio_province"]
+
+    gauges = get_basin_list(user_cfg['gauges_path'], division, province)
 
     # get attribute means/stds
-    db_path = str(user_cfg["run_dir"] / "attributes.db")
+    # db_path = str(user_cfg["run_dir"] / "attributes.db")
+    db_path = user_cfg['db_path']
     attributes = load_attributes(db_path=db_path, 
-                                 basins=basins,
-                                 drop_lat_lon=True)
+                                 gauges=gauges)
     means = attributes.mean()
     stds = attributes.std()
 
     # initialize Model
-    model = Model(input_size_dyn=5,
-                  input_size_stat=27,
+    input_size_stat = 0 if user_cfg["no_static"] else 20
+    input_size_dyn = 5 if (user_cfg["no_static"] or not user_cfg["concat_static"]) else 5 + input_size_stat
+
+    model = Model(input_size_dyn=input_size_dyn,
+                  input_size_stat=input_size_stat,
                   hidden_size=run_cfg["hidden_size"],
                   dropout=run_cfg["dropout"]).to(DEVICE)
-    weight_file = user_cfg["run_dir"] / "model_epoch30.pt"
+    weight_file = os.path.join(user_cfg["run_dir"], "model_epoch30.pt")
     model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
 
     overall_results = {}
     # process bar handle
-    pbar = tqdm(basins, file=sys.stdout)
-    for basin in pbar:
-        ds_test = CamelsTXT(camels_root=user_cfg["camels_root"],
-                            basin=basin,
+    pbar = tqdm(gauges, file=sys.stdout)
+    for gauge in pbar:
+        ds_test = CamelsSqlite(gage_id=gauge,
                             dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
                             is_train=False,
                             with_attributes=True,
@@ -595,15 +607,15 @@ def eval_robustness(user_cfg: Dict):
         step = 1
         for scale in scales:
             for _ in range(1 if scale == 0.0 else n_repetitions):
-                noise = np.random.normal(loc=0, scale=scale, size=27).astype(np.float32)
+                noise = np.random.normal(loc=0, scale=scale, size=input_size_stat).astype(np.float32)
                 noise = torch.from_numpy(noise).to(DEVICE)
                 nse = eval_with_added_noise(model, loader, noise)
                 basin_results[scale].append(nse)
                 pbar.set_postfix_str(f"Basin progress: {step}/{(len(scales)-1)*n_repetitions+1}")
                 step += 1
 
-        overall_results[basin] = basin_results
-    out_file = (Path(__file__).absolute().parent /
+        overall_results[gauge] = basin_results
+    out_file = os.path.join(Path(__file__).absolute().parent,
                 f'results/{user_cfg["run_dir"].name}_model_robustness.p')
     if not out_file.parent.is_dir():
         out_file.parent.mkdir(parents=True)
@@ -631,6 +643,7 @@ def eval_with_added_noise(model: torch.nn.Module, loader: DataLoader, noise: tor
     model.eval()
     preds, obs = None, None
     with torch.no_grad():
+        torch.cuda.empty_cache()
         for x_d, x_s, y in loader:
             x_d, x_s, y = x_d.to(DEVICE), x_s.to(DEVICE), y.to(DEVICE)
             batch_noise = noise.repeat(*x_s.size()[:2], 1)
@@ -668,14 +681,14 @@ def _store_results(user_cfg: Dict, run_cfg: Dict, results: pd.DataFrame):
 
     """
     if run_cfg["no_static"]:
-        file_name = user_cfg["run_dir"] / f"lstm_no_static_seed{run_cfg['seed']}.p"
+        file_name = os.path.join(user_cfg["run_dir"], f"lstm_no_static_seed{run_cfg['seed']}.p")
     else:
         if run_cfg["concat_static"]:
-            file_name = user_cfg["run_dir"] / f"lstm_seed{run_cfg['seed']}.p"
+            file_name = os.path.join(user_cfg["run_dir"], f"lstm_seed{run_cfg['seed']}.p")
         else:
-            file_name = user_cfg["run_dir"] / f"ealstm_seed{run_cfg['seed']}.p"
+            file_name = os.path.join(user_cfg["run_dir"], f"ealstm_seed{run_cfg['seed']}.p")
 
-    with (file_name).open('wb') as fp:
+    with open(file_name, 'wb') as fp:
         pickle.dump(results, fp)
 
     print(f"Sucessfully store results at {file_name}")
